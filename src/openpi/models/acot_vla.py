@@ -286,11 +286,23 @@ class ACOTConfig(_model.BaseModelConfig):
     attention_pooling_implicit_extractor: bool = False  # type: ignore
     downsample_based_implicit_extractor: bool = False  # type: ignore
 
+    # Task/stage prompting and supervision.
+    use_task_embedding_prompt: bool = False  # type: ignore
+    num_tasks: int = 10  # type: ignore
+    unknown_task_id: int = 0  # type: ignore
+    max_num_stages: int = 15  # type: ignore
+    stage_loss_weight: float = 0.1  # type: ignore
+    task_num_stages: tuple[int, ...] = ()
+
     def __post_init__(self):
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
         if self.discrete_state_input is None:
             object.__setattr__(self, "discrete_state_input", self.pi05)
+        if self.use_task_embedding_prompt and not self.task_num_stages:
+            object.__setattr__(self, "task_num_stages", tuple([self.max_num_stages] * self.num_tasks))
+        if self.task_num_stages and len(self.task_num_stages) != self.num_tasks:
+            raise ValueError("task_num_stages length must match num_tasks")
 
     @property
     @override
@@ -310,6 +322,7 @@ class ACOTConfig(_model.BaseModelConfig):
         image_mask_spec = jax.ShapeDtypeStruct([batch_size], jnp.bool_)
 
         with at.disable_typechecking():
+            tokenized_prompt_shape = [batch_size, 2] if self.use_task_embedding_prompt else [batch_size, self.max_token_len]
             observation_spec = _model.Observation(
                 images={
                     "base_0_rgb": image_spec,
@@ -322,8 +335,8 @@ class ACOTConfig(_model.BaseModelConfig):
                     "right_wrist_0_rgb": image_mask_spec,
                 },
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
-                tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
-                tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
+                tokenized_prompt=jax.ShapeDtypeStruct(tokenized_prompt_shape, jnp.int32),
+                tokenized_prompt_mask=jax.ShapeDtypeStruct(tokenized_prompt_shape, bool),
             )
         action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)
 
@@ -418,6 +431,27 @@ class ACOT_VLA(_model.BaseModel):
 
         self.coarse_action_out_proj = nnx.Linear(coarse_action_expert_config.width, config.action_dim, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
+
+        self.use_task_embedding_prompt = config.use_task_embedding_prompt
+        self.num_tasks = config.num_tasks
+        self.unknown_task_id = config.unknown_task_id
+        self.max_num_stages = config.max_num_stages
+        self.stage_loss_weight = config.stage_loss_weight
+        self._task_num_stages = tuple(int(x) for x in config.task_num_stages)
+
+        if self.use_task_embedding_prompt:
+            self.task_embeddings = nnx.Embed(
+                num_embeddings=self.num_tasks,
+                features=paligemma_config.width,
+                rngs=rngs,
+            )
+            self.stage_embeddings = nnx.Embed(
+                num_embeddings=self.max_num_stages,
+                features=paligemma_config.width,
+                rngs=rngs,
+            )
+            self.task_stage_fusion = nnx.Linear(2 * paligemma_config.width, paligemma_config.width, rngs=rngs)
+            self.stage_classifier = nnx.Linear(paligemma_config.width, self.max_num_stages, rngs=rngs)
         
         self.adopt_explicit_action_reasoner = config.adopt_explicit_action_reasoner
         if self.adopt_explicit_action_reasoner:
@@ -511,6 +545,39 @@ class ACOT_VLA(_model.BaseModel):
         self.deterministic = True
         self.coarse_action_horizon = config.coarse_action_horizon
 
+    def _extract_task_stage_from_prompt(self, obs: _model.Observation) -> tuple[jax.Array, jax.Array] | None:
+        if obs.tokenized_prompt is None:
+            return None
+        if obs.tokenized_prompt.ndim != 2 or obs.tokenized_prompt.shape[1] < 2:
+            return None
+
+        task_ids = jnp.clip(obs.tokenized_prompt[:, 0], 0, self.num_tasks - 1)
+        stage_ids = jnp.clip(obs.tokenized_prompt[:, 1], 0, self.max_num_stages - 1)
+        return task_ids, stage_ids
+
+    def _compute_subtask_logits(
+        self,
+        prefix_out: jax.Array,
+        obs: _model.Observation,
+    ) -> jax.Array | None:
+        if not self.use_task_embedding_prompt:
+            return None
+
+        task_stage = self._extract_task_stage_from_prompt(obs)
+        if task_stage is None:
+            return None
+
+        task_ids, _ = task_stage
+        # We append the fused task-stage token as the final prefix token.
+        pooled = prefix_out[:, -1, :]
+        logits = self.stage_classifier(pooled)
+
+        task_num_stages = jnp.asarray(self._task_num_stages, dtype=jnp.int32)
+        valid_stage_counts = task_num_stages[task_ids]
+        stage_range = jnp.arange(self.max_num_stages)
+        valid_mask = stage_range[None, :] < valid_stage_counts[:, None]
+        return jnp.where(valid_mask, logits, -jnp.inf)
+
 
     @at.typecheck
     def embed_prefix(
@@ -534,13 +601,24 @@ class ACOT_VLA(_model.BaseModel):
             # image tokens attend to each other
             ar_mask += [False] * image_tokens.shape[1]
 
-        # add language (aka tokenized inputs)
+        # Add prompt tokens. In task mode, this is [task_id, stage_id] encoded through trainable embeddings.
         if obs.tokenized_prompt is not None:
-            tokenized_inputs = self.PaliGemma.llm(obs.tokenized_prompt, method="embed")
-            tokens.append(tokenized_inputs)
-            input_mask.append(obs.tokenized_prompt_mask)
-            # full attention between image and language inputs
-            ar_mask += [False] * tokenized_inputs.shape[1]
+            task_stage = self._extract_task_stage_from_prompt(obs)
+            if self.use_task_embedding_prompt and task_stage is not None:
+                task_ids, stage_ids = task_stage
+                task_token = self.task_embeddings(task_ids)
+                stage_token = self.stage_embeddings(stage_ids)
+                fused_token = self.task_stage_fusion(jnp.concatenate([task_token, stage_token], axis=-1))
+                prompt_tokens = jnp.stack([task_token, fused_token], axis=1)
+                tokens.append(prompt_tokens)
+                input_mask.append(jnp.ones((prompt_tokens.shape[0], prompt_tokens.shape[1]), dtype=jnp.bool_))
+                ar_mask += [False] * prompt_tokens.shape[1]
+            else:
+                tokenized_inputs = self.PaliGemma.llm(obs.tokenized_prompt, method="embed")
+                tokens.append(tokenized_inputs)
+                input_mask.append(obs.tokenized_prompt_mask)
+                # full attention between image and language inputs
+                ar_mask += [False] * tokenized_inputs.shape[1]
 
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
@@ -696,7 +774,7 @@ class ACOT_VLA(_model.BaseModel):
         self, rng: at.KeyArrayLike,
         observation: _model.Observation,
         actions: _model.Actions,
-        coarse_actions: _model.CoarseActions, *, train: bool = False
+        coarse_actions: _model.CoarseActions, *, train: bool = False, return_metrics: bool = False
     ) -> at.Float[at.Array, "*b ah"]:
 
         # preprocess_rng, _, time_rng, coarse_action_noise_rng, _, expert_action_noise_rng = jax.random.split(rng, 6)
@@ -723,7 +801,12 @@ class ACOT_VLA(_model.BaseModel):
 
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions_prefix = jnp.cumsum(prefix_mask, axis=1) - 1
-        _, kv_cache = self.PaliGemma.llm([prefix_tokens, None, None], mask=prefix_attn_mask, positions=positions_prefix)
+        (prefix_expert_in_out, _, _), kv_cache = self.PaliGemma.llm(
+            [prefix_tokens, None, None],
+            mask=prefix_attn_mask,
+            positions=positions_prefix,
+        )
+        subtask_logits = self._compute_subtask_logits(prefix_expert_in_out, observation)
 
         if self.adopt_explicit_action_reasoner:
             # suffix forward to get explicit action reference
@@ -784,12 +867,38 @@ class ACOT_VLA(_model.BaseModel):
             action_diff_ref = u_ref_t - v_ref_t
             action_diff_expert = u_expert_t - v_expert_t
             # Since we set the balance factor as 0.5, the following loss is equal
-            return jnp.mean(jnp.square(action_diff_ref)) + jnp.mean(jnp.square(action_diff_expert))
+            base_loss = jnp.mean(jnp.square(action_diff_ref)) + jnp.mean(jnp.square(action_diff_expert))
 
         else:
             v_expert_t = self.action_out_proj(suffix_expert_out[:, -self.action_horizon :])
             action_diff_expert = u_expert_t - v_expert_t
-            return jnp.mean(jnp.square(action_diff_expert))
+            base_loss = jnp.mean(jnp.square(action_diff_expert))
+
+        stage_loss_value = jnp.asarray(0.0, dtype=base_loss.dtype)
+        if train and subtask_logits is not None:
+            task_stage = self._extract_task_stage_from_prompt(observation)
+            if task_stage is not None:
+                task_ids, stage_ids = task_stage
+                task_num_stages = jnp.asarray(self._task_num_stages, dtype=jnp.int32)
+                max_valid = jnp.maximum(task_num_stages[task_ids] - 1, 0)
+                stage_ids = jnp.minimum(stage_ids, max_valid)
+                stage_loss = -jax.nn.log_softmax(subtask_logits)[jnp.arange(stage_ids.shape[0]), stage_ids]
+                stage_loss_value = jnp.mean(stage_loss)
+                total_loss = base_loss + self.stage_loss_weight * stage_loss_value
+                if return_metrics:
+                    return total_loss, {
+                        "base_loss": base_loss,
+                        "stage_loss": stage_loss_value,
+                    }
+                return total_loss
+
+        if return_metrics:
+            return base_loss, {
+                "base_loss": base_loss,
+                "stage_loss": stage_loss_value,
+            }
+
+        return base_loss
 
     @override
     def sample_actions(
@@ -813,7 +922,8 @@ class ACOT_VLA(_model.BaseModel):
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
-        _, kv_cache = self.PaliGemma.llm([prefix_tokens, None, None], mask=prefix_attn_mask, positions=positions)
+        (prefix_out, _, _), kv_cache = self.PaliGemma.llm([prefix_tokens, None, None], mask=prefix_attn_mask, positions=positions)
+        subtask_logits = self._compute_subtask_logits(prefix_out, observation)
 
         if self.adopt_implicit_action_reasoner:
             K_all, V_all = kv_cache
@@ -895,7 +1005,9 @@ class ACOT_VLA(_model.BaseModel):
         
         x_0_expert, _, _ = jax.lax.while_loop(cond_expert, step_expert, (expert_action_noise, 1.0, 1))
 
+        result = {"actions": x_0_expert}
         if self.adopt_explicit_action_reasoner:
-            return {"actions": x_0_expert, "coarse_actions": explicit_action_reason}
-        else:
-            return {"actions": x_0_expert}
+            result["coarse_actions"] = explicit_action_reason
+        if subtask_logits is not None:
+            result["subtask_logits"] = subtask_logits
+        return result

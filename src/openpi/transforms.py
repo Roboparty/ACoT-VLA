@@ -13,6 +13,7 @@ from openpi_client import image_tools
 from openpi.models import tokenizer as _tokenizer
 from openpi.shared import array_typing as at
 from openpi.shared import normalize as _normalize
+from openpi.shared import task_stage as _task_stage
 
 DataDict: TypeAlias = at.PyTree
 NormStats: TypeAlias = _normalize.NormStats
@@ -316,6 +317,72 @@ class TokenizePrompt(DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class TokenizeTaskAndStage(DataTransformFn):
+    """Encode task and stage into a fixed 2-token prompt: [task_id, stage_id]."""
+
+    default_task_id: int = 0
+    default_stage_id: int = 0
+    max_stage_id: int = 14
+
+    def _to_python_str(self, value) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, bytes):
+            return value.decode("utf-8")
+        if isinstance(value, str):
+            return value
+        if hasattr(value, "item"):
+            item = value.item()
+            if isinstance(item, bytes):
+                return item.decode("utf-8")
+            if isinstance(item, str):
+                return item
+        return str(value)
+
+    def _to_python_int(self, value, default: int) -> int:
+        if value is None:
+            return default
+        if isinstance(value, (int, np.integer)):
+            return int(value)
+        if hasattr(value, "item"):
+            return int(value.item())
+        return int(value)
+
+    def __call__(self, data: DataDict) -> DataDict:
+        sanitized = {**data}
+        # Allow pre-tokenized data to pass through unchanged.
+        if "tokenized_prompt" in sanitized and "tokenized_prompt_mask" in sanitized:
+            sanitized.pop("prompt", None)
+            sanitized.pop("sub_task_name", None)
+            sanitized.pop("task", None)
+            sanitized.pop("task_name", None)
+            return sanitized
+
+        task_name = self._to_python_str(sanitized.get("sub_task_name"))
+        if task_name is None:
+            task_name = self._to_python_str(sanitized.get("task"))
+        if task_name is None:
+            task_name = self._to_python_str(sanitized.get("task_name"))
+        if task_name is None:
+            task_name = self._to_python_str(sanitized.get("prompt"))
+
+        task_id = _task_stage.task_name_to_id(task_name, default_id=self.default_task_id)
+        stage_id = self._to_python_int(sanitized.get("stage_id"), self.default_stage_id)
+        stage_id = max(0, min(self.max_stage_id, stage_id))
+
+        sanitized.pop("prompt", None)
+        sanitized.pop("sub_task_name", None)
+        sanitized.pop("task", None)
+        sanitized.pop("task_name", None)
+
+        return {
+            **sanitized,
+            "tokenized_prompt": np.asarray([task_id, stage_id], dtype=np.int32),
+            "tokenized_prompt_mask": np.asarray([True, True], dtype=bool),
+        }
+
+
+@dataclasses.dataclass(frozen=True)
 class TokenizeFASTInputs(DataTransformFn):
     tokenizer: _tokenizer.FASTTokenizer
 
@@ -381,11 +448,14 @@ class PromptFromHighlevelInstruction(DataTransformFn):
 
     def __call__(self, data: DataDict) -> DataDict:
         if "episode_index" not in data:
-            raise ValueError('Cannot extract prompt without "task_index"')
+            raise ValueError('Cannot extract prompt without "episode_index"')
 
         episode_index = int(data["episode_index"])
         frame_index = int(data["frame_index"])
-        segments = self.instruction_segments.get(str(episode_index))
+        segments = self.instruction_segments.get(str(episode_index), [])
+
+        if not segments:
+            return {**data, "stage_id": np.asarray(0, dtype=np.int32)}
 
         segment_id = len(segments) - 1
         segments[0]['start_frame_index'] = 0
@@ -399,7 +469,10 @@ class PromptFromHighlevelInstruction(DataTransformFn):
             instruction = segment['instruction']
         else:
             raise ValueError(f"No segment found for episode {episode_index} and frame {frame_index}")
-        return {**data, "prompt": instruction}
+
+        # Keep a coarse stage label for task/stage prompting. If absent downstream, this is ignored.
+        stage_id = np.asarray(segment_id, dtype=np.int32)
+        return {**data, "prompt": instruction, "stage_id": stage_id}
 
 @dataclasses.dataclass(frozen=True)
 class PadStatesAndActions(DataTransformFn):

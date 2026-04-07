@@ -85,6 +85,40 @@ def test_tokenize_no_prompt():
         transform({})
 
 
+def test_tokenize_task_and_stage():
+    transform = _transforms.TokenizeTaskAndStage(default_task_id=0, default_stage_id=0, max_stage_id=14)
+
+    data = transform({"task": "sorting_packages", "stage_id": np.asarray(3, dtype=np.int32)})
+
+    assert np.allclose(data["tokenized_prompt"], np.asarray([0, 3], dtype=np.int32))
+    assert np.allclose(data["tokenized_prompt_mask"], np.asarray([True, True], dtype=bool))
+
+
+def test_tokenize_task_and_stage_continuous_sorting():
+    transform = _transforms.TokenizeTaskAndStage(default_task_id=0, default_stage_id=0, max_stage_id=14)
+
+    data = transform({"task": "sorting_packages_continuous", "stage_id": np.asarray(2, dtype=np.int32)})
+
+    assert np.allclose(data["tokenized_prompt"], np.asarray([0, 2], dtype=np.int32))
+    assert np.allclose(data["tokenized_prompt_mask"], np.asarray([True, True], dtype=bool))
+
+
+def test_prompt_from_highlevel_instruction_adds_stage_id():
+    transform = _transforms.PromptFromHighlevelInstruction(
+        {
+            "0": [
+                {"start_frame_index": 0, "end_frame_index": 10, "instruction": "first"},
+                {"start_frame_index": 10, "end_frame_index": 20, "instruction": "second"},
+            ]
+        }
+    )
+
+    data = transform({"episode_index": 0, "frame_index": 12})
+
+    assert data["prompt"] == "second"
+    assert int(data["stage_id"]) == 1
+
+
 def test_transform_dict():
     # Rename and remove keys.
     input = {"a": {"b": 1, "c": 2}}

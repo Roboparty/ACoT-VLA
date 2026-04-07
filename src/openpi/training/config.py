@@ -31,6 +31,7 @@ import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.optimizer as _optimizer
+import openpi.training.task_weighting as _task_weighting
 import openpi.training.weight_loaders as weight_loaders
 import openpi.transforms as _transforms
 
@@ -99,6 +100,14 @@ class DataConfig:
 
     dataloader_sampler: str | None = ''
 
+    # Optional task-level sampling weights used by the "task_weighted" sampler.
+    # Keys are task names; the sampler applies basic canonicalization (case/underscore/spacing).
+    task_sampling_weights: Dict[str, float] = dataclasses.field(default_factory=dict)
+    # Tasks listed here will be forced to neutral weight 1.0 (useful when score is unavailable/noisy).
+    task_sampling_ignore: Sequence[str] = dataclasses.field(default_factory=tuple)
+    # Seed for deterministic weighted frame sampling.
+    weighted_sampler_seed: int = 0
+
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
     # Action space for DROID dataset.
@@ -145,6 +154,19 @@ class ModelTransformFactory(GroupFactory):
                 )
             case _model.ModelType.ACOT_VLA_PI0:
                 assert isinstance(model_config, acot_vla.ACOTConfig)
+                if model_config.use_task_embedding_prompt:
+                    return _transforms.Group(
+                        inputs=[
+                            _transforms.InjectDefaultPrompt(self.default_prompt),
+                            _transforms.ResizeImages(224, 224),
+                            _transforms.TokenizeTaskAndStage(
+                                default_task_id=model_config.unknown_task_id,
+                                default_stage_id=0,
+                                max_stage_id=model_config.max_num_stages - 1,
+                            ),
+                            _transforms.ACOTPadStatesAndActions(model_config.action_dim),
+                        ],
+                    )
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
@@ -157,6 +179,19 @@ class ModelTransformFactory(GroupFactory):
                 )
             case _model.ModelType.ACOT_VLA_PI05:
                 assert isinstance(model_config, acot_vla.ACOTConfig)
+                if model_config.use_task_embedding_prompt:
+                    return _transforms.Group(
+                        inputs=[
+                            _transforms.InjectDefaultPrompt(self.default_prompt),
+                            _transforms.ResizeImages(224, 224),
+                            _transforms.TokenizeTaskAndStage(
+                                default_task_id=model_config.unknown_task_id,
+                                default_stage_id=0,
+                                max_stage_id=model_config.max_num_stages - 1,
+                            ),
+                            _transforms.ACOTPadStatesAndActions(model_config.action_dim),
+                        ],
+                    )
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
@@ -1808,7 +1843,7 @@ _CONFIGS = [
         ),
         num_train_steps=51_000,
         save_interval=10000 if not os.getenv("DEBUG_MODE", default=False) == "true" else 200,
-        num_workers=48 if not os.getenv("DEBUG_MODE", default=False) == "true" else 1,
+        num_workers=24 if not os.getenv("DEBUG_MODE", default=False) == "true" else 1,
         batch_size=128 if not os.getenv("DEBUG_MODE", default=False) == "true" else 16,
         freeze_filter=acot_vla.ACOTConfig().get_freeze_filter(freeze_vision = False, freeze_llm = True, freeze_dual_ae=[False, False]),
     ),
@@ -1818,27 +1853,45 @@ _CONFIGS = [
         # For the ICRA sim challenge, we set both coarse and fine action horizons to 30 since the tasks are relatively long-horizon.
         # We also use both explicit and implicit action reasoners, and use the downsample-based implicit extractor.
         # You can modify these design choices based on the specific tasks and dataset. 
-        model=acot_vla.ACOTConfig(coarse_action_horizon=30, action_horizon=30, paligemma_variant="gemma_2b_lora", adopt_explicit_action_reasoner=True, adopt_implicit_action_reasoner=True, downsample_based_implicit_extractor=True),
+        model=acot_vla.ACOTConfig(
+            coarse_action_horizon=30,
+            action_horizon=30,
+            paligemma_variant="gemma_2b_lora",
+            adopt_explicit_action_reasoner=True,
+            adopt_implicit_action_reasoner=True,
+            downsample_based_implicit_extractor=True,
+            use_task_embedding_prompt=True,
+            num_tasks=9,
+            max_num_stages=7,
+            task_num_stages=(7, 1, 2, 2, 3, 2, 2, 2, 5),
+            stage_loss_weight=0.1,
+        ),
         data=LerobotACOTGo2DataConfig(
             default_prompt = "This is the icra simulation challenge baseline config. Please refer to the README for details.",
-            # Fill in the 9 tasks for training. You can use all 9 tasks, or a subset of them based on your preference.
+            # Fill in the tasks for training. You can use all tasks, or a subset of them based on your preference.
             repo_id = [
-                "/mnt/public/E6/lerobot/7819/task_5833", # Pouring workpieces, single-arm task, uses right hand only
-                "/mnt/public/E6/lerobot/7820/task_5832", # Opening a door, single-arm task, uses right hand only
-                "/mnt/public/E6/lerobot/8153", # Scooping popcorn, single-arm task, uses right hand only
-                "/mnt/public/E6/lerobot/7821/task_5829", # Carrying a pot, dual-arm task, uses both hands simultaneously
-
-                "/mnt/public/E6/lerobot/7837/task_5441", # Grabbing toys, dual-arm task, uses left or right hand based on instruction
-                "/mnt/public/E6/lerobot/7944/task_6100", # Supermarket item retrieval, dual-arm task, uses left or right hand based on instruction
-                "/mnt/public/E6/lerobot/7818/task_5853", # Supermarket restocking, dual-arm task, uses left or right hand based on instruction
-                "/mnt/public/E6/lerobot/8169/2026021101/gripper/task_6167", # packages sorting, grasps objects based on instruction, single-arm task but involves waist movement
-
-                "/mnt/public/E6/lerobot/7878//task_5828", # Arranging the table, dual-arm task, uses both hands simultaneously
+                "/mnt/h20_1data0/ygx_dataset/AgiBotWorldChallenge-2026/Reasoning2Action-Sim/dataset_without_depth/clean_the_desktop_part_1",
+                "/mnt/h20_1data0/ygx_dataset/AgiBotWorldChallenge-2026/Reasoning2Action-Sim/dataset_without_depth/clean_the_desktop_part_2",
+                "/mnt/h20_1data0/ygx_dataset/AgiBotWorldChallenge-2026/Reasoning2Action-Sim/dataset_without_depth/clean_the_desktop_addition",
+                "/mnt/h20_1data0/ygx_dataset/AgiBotWorldChallenge-2026/Reasoning2Action-Sim/dataset_without_depth/hold_pot",
+                "/mnt/h20_1data0/ygx_dataset/AgiBotWorldChallenge-2026/Reasoning2Action-Sim/dataset_without_depth/open_door",
+                "/mnt/h20_1data0/ygx_dataset/AgiBotWorldChallenge-2026/Reasoning2Action-Sim/dataset_without_depth/place_block_into_box",
+                "/mnt/h20_1data0/ygx_dataset/AgiBotWorldChallenge-2026/Reasoning2Action-Sim/dataset_without_depth/pour_workpiece",
+                "/mnt/h20_1data0/ygx_dataset/AgiBotWorldChallenge-2026/Reasoning2Action-Sim/dataset_without_depth/scoop_popcorn",
+                "/mnt/h20_1data0/ygx_dataset/AgiBotWorldChallenge-2026/Reasoning2Action-Sim/dataset_without_depth/scoop_popcorn_part_2",
+                "/mnt/h20_1data0/ygx_dataset/AgiBotWorldChallenge-2026/Reasoning2Action-Sim/dataset_without_depth/sorting_packages_part_1",
+                "/mnt/h20_1data0/ygx_dataset/AgiBotWorldChallenge-2026/Reasoning2Action-Sim/dataset_without_depth/sorting_packages_part_2",
+                "/mnt/h20_1data0/ygx_dataset/AgiBotWorldChallenge-2026/Reasoning2Action-Sim/dataset_without_depth/sorting_packages_part_3",
+                "/mnt/h20_1data0/ygx_dataset/AgiBotWorldChallenge-2026/Reasoning2Action-Sim/dataset_without_depth/stock_and_straighten_shelf",
+                "/mnt/h20_1data0/ygx_dataset/AgiBotWorldChallenge-2026/Reasoning2Action-Sim/dataset_without_depth/stock_and_straighten_shelf_part_2",
+                "/mnt/h20_1data0/ygx_dataset/AgiBotWorldChallenge-2026/Reasoning2Action-Sim/dataset_without_depth/take_wrong_item_shelf",
             ],
             # Set the asset dir to specify normalization stats calculated from the dataset
             assets=AssetsConfig(
                 assets_dir=None,
-                asset_id="/mnt/public/zhonglinqing/data/datasets/genie_sim_icra_datasets/nine_dataset_merge_assets",
+                # Keep a trailing slash so inference loader treats checkpoint assets root
+                # (/app/checkpoints/.../assets/norm_stats.json) as the norm-stats location.
+                asset_id="all_tasks_merged/",
             ),
             # this line defines a mapping from task name to (prompt, probability of replacement) for training. 
             # If the current episode's task name matches one of the keys in the mapping, then with the corresponding probability, 
@@ -1900,13 +1953,29 @@ _CONFIGS = [
                             "prompt": "prompt",
                             # repack task name and episode id here for specific prompt replacement in training
                             "task": "task",
-                            "episode_index": "episode_index"
+                            "episode_index": "episode_index",
+                            "stage_id": "stage_id",
                         }
                     )
                 ]
             ),
-            # this line allows using episode level annotation for training, essential for instruction following
-            base_config = DataConfig(dataloader_sampler = "subtask", prompt_from_hl_instruction = True),
+            # this line allows using episode level annotation for training, essential for instruction following.
+            # We enable task-weighted sampling to up-weight hard tasks and down-weight easy tasks.
+            # Weight generation is automatic from the 27-team leaderboard.
+            base_config = DataConfig(
+                dataloader_sampler="task_weighted",
+                prompt_from_hl_instruction=True,
+                task_sampling_weights=_task_weighting.generate_task_sampling_weights(
+                    method=os.getenv("TASK_WEIGHT_METHOD", "mean"),  # mean or quantile
+                    min_weight=float(os.getenv("TASK_WEIGHT_MIN", "0.75")),
+                    max_weight=float(os.getenv("TASK_WEIGHT_MAX", "3.0")),
+                    gamma=float(os.getenv("TASK_WEIGHT_GAMMA", "1.2")),
+                    ignore_tasks=tuple(
+                        x.strip().lower() for x in os.getenv("TASK_WEIGHT_IGNORE", "").split(",") if x.strip()
+                    ),
+                ),
+                weighted_sampler_seed=0,
+            ),
             # this line is important for action cot training, it shifts the action sequence by a certain number of steps 
             # to create the input for the coarse action reasoner and the final action head. 
             # You can tune these values based on the characteristics of your dataset. 
@@ -1926,15 +1995,15 @@ _CONFIGS = [
         optimizer = _optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay = 0.999,
         weight_loader = weight_loaders.ACOTCheckpointWeightLoader(
-            "/mnt/public/zhonglinqing/pkgs/pi05_model/params"
+            "/data/ygx_data/checkpoints/pi05_model/params"
         ),
         num_train_steps = 50_000,
         save_interval = 5000 if not os.getenv("DEBUG_MODE", default=False) == "true" else 200,
         num_workers = 24 if not os.getenv("DEBUG_MODE", default=False) == "true" else 1,
-        batch_size = 256 if not os.getenv("DEBUG_MODE", default=False) == "true" else 16,
+        batch_size = 128 if not os.getenv("DEBUG_MODE", default=False) == "true" else 16,
         # You can select to freeze certain parts of the model during training by setting the corresponding flags to True
         freeze_filter = acot_vla.ACOTConfig(paligemma_variant="gemma_2b_lora").get_freeze_filter(
-            freeze_vision = False, freeze_llm = True, freeze_llm_embedder=True, freeze_dual_ae=[False, False]
+            freeze_vision = False, freeze_llm = False, freeze_llm_embedder=False, freeze_dual_ae=[False, False]
         )
     )
 ]

@@ -194,6 +194,7 @@ def create_torch_dataset(
                 for dataset_meta in dataset_metas
                 for key in data_config.action_sequence_keys
             },
+            tolerances_s={r: 0.3 for r in repo_id},  # Increase tolerance to 300ms to handle video timestamp sync issues
         )
         if data_config.prompt_from_task:
             for n, d in enumerate(dataset._datasets):
@@ -216,6 +217,7 @@ def create_torch_dataset(
                 key: [t / dataset_meta.fps for t in range(action_chunk_size)]
                 for key in data_config.action_sequence_keys
             },
+            tolerance_s=0.3,  # Increase tolerance to 300ms to handle video timestamp sync issues
         )
 
         if data_config.prompt_from_task:
@@ -363,9 +365,15 @@ def create_torch_data_loader(
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
     sampler = None
-    if data_config.dataloader_sampler != '':
+    if data_config.dataloader_sampler:
         from openpi.training.sampler import FrameSampler
-        sampler = FrameSampler(dataset, data_config.dataloader_sampler)
+        sampler = FrameSampler(
+            dataset,
+            data_config.dataloader_sampler,
+            task_sampling_weights=data_config.task_sampling_weights,
+            task_sampling_ignore=tuple(data_config.task_sampling_ignore),
+            sampling_seed=data_config.weighted_sampler_seed,
+        )
         shuffle = False
 
     dataset = SafeDataset(dataset)

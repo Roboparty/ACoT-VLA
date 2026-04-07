@@ -88,6 +88,11 @@ class Go2Inputs(transforms.DataTransformFn):
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
 
+        # Preserve only numeric prompt tokens to keep downstream JAX trees numeric-only.
+        for key in ("tokenized_prompt", "tokenized_prompt_mask", "stage_id"):
+            if key in data:
+                inputs[key] = data[key]
+
         return inputs
 
 
@@ -231,6 +236,11 @@ class Go2ACOTInputs(transforms.DataTransformFn):
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
 
+        # Preserve only numeric metadata; avoid carrying raw strings into JAX sharding.
+        for key in ("tokenized_prompt", "tokenized_prompt_mask", "stage_id", "episode_index"):
+            if key in data:
+                inputs[key] = data[key]
+
         return inputs
 
 
@@ -240,4 +250,8 @@ class Go2ACOTOutputs(transforms.DataTransformFn):
 
     def __call__(self, data: dict) -> dict:
         keys = ['coarse_actions', 'actions']
-        return {key: np.asarray(data[key][:, :21]) for key in keys if key in data}
+        outputs = {key: np.asarray(data[key][:, :21]) for key in keys if key in data}
+        # Keep stage logits for websocket server stage tracking.
+        if "subtask_logits" in data:
+            outputs["subtask_logits"] = np.asarray(data["subtask_logits"])
+        return outputs

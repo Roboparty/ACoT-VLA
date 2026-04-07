@@ -205,14 +205,29 @@ def acot_train_step(
         model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions,
         coarse_actions: _model.CoarseActions
     ):
-        return model.compute_loss(rng, observation, actions, coarse_actions, train=True)
+        loss_out = model.compute_loss(  # type: ignore[call-arg]
+            rng,
+            observation,
+            actions,
+            coarse_actions,
+            train=True,
+            return_metrics=True,
+        )
+        if isinstance(loss_out, tuple):
+            return loss_out
+
+        # Fallback for models that only return scalar loss.
+        zero = jnp.asarray(0.0, dtype=loss_out.dtype)
+        return loss_out, {"base_loss": loss_out, "stage_loss": zero}
 
     train_rng = jax.random.fold_in(rng, state.step)
     observation, actions, coarse_actions = batch
 
     # Filter out frozen params.
     diff_state = nnx.DiffState(0, config.trainable_filter)
-    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions, coarse_actions)
+    (loss, loss_aux), grads = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)(
+        model, train_rng, observation, actions, coarse_actions
+    )
 
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
@@ -242,6 +257,8 @@ def acot_train_step(
     )
     info = {
         "loss": loss,
+        "base_loss": loss_aux["base_loss"],
+        "stage_loss": loss_aux["stage_loss"],
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
     }
