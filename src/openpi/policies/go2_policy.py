@@ -131,7 +131,7 @@ class Go2ACOTInputs(transforms.DataTransformFn):
             data["state"] = data["state"][state_indices]
 
         if "actions" in data:
-            assert data["actions"].shape[1] == 40
+            assert data["actions"].shape[1] in (40, 44)
             data["actions"] = np.column_stack((data["actions"][:, 16:30], data["actions"][:, 0:2], data["actions"][:, 33:38]))
         return data
     

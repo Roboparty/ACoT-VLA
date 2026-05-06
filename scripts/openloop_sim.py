@@ -13,8 +13,8 @@ import torch
 from torchvision.transforms.functional import to_pil_image
 from PIL import Image
 
-config = _config.get_config("acot_realrobot_finetune")
-checkpoint_dir = "/mnt/h20_1data0/ygx_dataset/checkpoints/acot_realrobot_finetune/realrobot_finetune_v1/20000"
+config = _config.get_config("acot_icra_sim_custom_dataset")
+checkpoint_dir = "/mnt/h20_1data0/ygx_dataset/checkpoints/acot_icra_sim_custom_dataset/resume_from_baseline/99999"
 
 # Create a trained policy.
 policy = _policy_config.create_trained_policy(config, checkpoint_dir)
@@ -37,8 +37,7 @@ dataset = _data_loader.TransformedDataset(
 gt_input_transforms = _transforms.compose(data_config.data_transforms.inputs)
 gt_output_transforms = _transforms.compose(data_config.data_transforms.outputs)
 
-episode_length = 4745  # episode 0 of task_8343
-max_inferences = episode_length // 30
+max_inferences = 20 # set to determine max infer times
 chunk_size = 30
 
 all_gt_actions = []
